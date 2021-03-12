@@ -14,15 +14,24 @@
 extern int errno ;
 #define WRITE_FD 104
 
+//arguments in a command
 struct arguments
 {
     char* argument;
     struct arguments* next;
 };
+//contains atomic commands in a command with redirection using pipes
+struct simple_command{
+    char* binaryFile;
+    struct arguments* arguments;
+    int num_args;
+    struct simple_command* next_simple;
+};
 
 struct command
 {
     /* data */
+    struct simple_command* basic;   //in case there is redirection with pipes
     int pid;
     int background;
     int current;
@@ -32,12 +41,15 @@ struct command
     struct arguments* arguments;
 };
 
+//list of commands
 struct commands
 {
     struct command det_com;
     struct commands *command_next;
 };
 
+
+//list of current processes;
 struct current_processes{
     int pid;
     char* binaryFile;
@@ -53,20 +65,28 @@ struct current_processes* curr_proc_h = NULL;
 char* command_shell;
 
 void handler(int sig);
-void deleteCurrentProc(struct current_processes** curr_proc_head,int pid);
-void printCurrentProc(struct current_processes* curr_proc_h);
-void addCurrentProc(struct current_processes** curr_proc_head,int pid,char* binaryFile);
-void printCurrentProc(struct current_processes* curr_proc_h);
-void change_dir();
-struct command Search(struct commands* head,int mode,int num,char* name,int pid);
+//Handler functions for list of current processes
+void deleteCurrentProc(struct current_processes** curr_proc_head,int pid); //remove the background process's pid (when the background process signals the parent that its finished) from the list of currently executing processes
+void printCurrentProc(struct current_processes* curr_proc_h); //prints all the currently executing process- used in $pid current
+void addCurrentProc(struct current_processes** curr_proc_head,int pid,char* binaryFile); //add a backgroud process details when a background starts executing
+
+struct command Search(struct commands* head,int mode,int num,char* name,int pid);   //search from all processes executed based on PID, Order Number and Name
+//Handler functions for arguments of a command
 void PrintArguments(struct arguments* head);
-void addCommand(struct commands** head_,struct command add);
 void addArgument(struct arguments** head,char* arg);
+//Handler functions for list of commands
+void addCommand(struct commands** head_,struct command add);
 void PrintHis(struct commands* head,int total_commands,int N);
-int Exec(struct command execute,int max_size_command);
-int Exec_background(struct command execute,int max_size_command);
+//Handler functions for basic commands in a command using pipes
+void AddSimpleCommand(struct simple_command** head,struct simple_command add);
+void PrintSimpleCommand(struct simple_command* head);
+int Exec_simple_commands(struct simple_command* execute_simple, int max_size_command,int pipes);
+
+int Exec(struct command execute,int max_size_command,int background);
 void command_prompt(struct commands** head_c,char* prog_name);
+
 char* extract_display_info(int mode);
+void change_dir();  //for change directory functionality
 void sigproc();
 
 int main(int argc,char *argv[]) {
@@ -115,7 +135,7 @@ void handler(int sig)
                 struct command comp = Search(head_c,3,-1,"\0",p);
                 char *err = (estat == 0) ? "success" : "failure";
                 // printf("--- executed with PID %d exited with status %d (%s)----\n", p, estat, err);
-                printf("--- %s executed with PID %d exited with status %d (%s)----\n",comp.binaryFile, p, estat, err);
+                printf("--- %s executed with PID %d exited with status %d----\n",comp.binaryFile, p, estat);
                 deleteCurrentProc(&curr_proc_h,p);
             }
         //    printf("\nPid %d exited with status %d.", p, status);
@@ -196,6 +216,7 @@ void addCommand(struct commands** head_,struct command add){
     new_command->det_com.pid = add.pid;
     new_command->det_com.background = add.background;
     new_command->det_com.command_index = add.command_index;
+    new_command->det_com.basic = add.basic;
     new_command->command_next = NULL;
     if (*head_==NULL) {
         *head_ = new_command;
@@ -212,6 +233,7 @@ void addCommand(struct commands** head_,struct command add){
     curr->command_next->det_com.command_index = add.command_index;
     curr->command_next->det_com.pid = add.pid;
     curr->command_next->det_com.background = add.background;
+    curr->command_next->det_com.basic = add.basic;
     curr->command_next->command_next = NULL;
     // PrintCommands(*head_);
     // return head;
@@ -268,23 +290,270 @@ struct command Search(struct commands* head,int mode,int num,char* name,int pid)
     return empty;
 } 
 
-int Exec(struct command execute,int max_size_command) {
+void AddSimpleCommand(struct simple_command** head_,struct simple_command add) {
+    struct simple_command* new_command =  (struct simple_command*)malloc(sizeof(struct simple_command));
+    new_command->binaryFile = add.binaryFile;
+    new_command->arguments = add.arguments;
+    new_command->num_args = add.num_args;
+    new_command->next_simple = NULL;
+    if (*head_==NULL) {
+        *head_ = new_command;
+        return;
+    }
+    struct simple_command* curr = *head_;
+    while(curr->next_simple!=NULL) {
+        curr = curr->next_simple;
+    }
+    curr->next_simple = malloc(sizeof(struct simple_command));
+    curr->next_simple->binaryFile = add.binaryFile;
+    curr->next_simple->arguments = add.arguments;
+    curr->next_simple->num_args = add.num_args;
+    curr->next_simple->next_simple= NULL;
+    // PrintCommands(*head_);
+    // return head;
+}
+
+void PrintSimpleCommand(struct simple_command* head) {
+    while(head!=NULL) {
+        PrintArguments(head->arguments);
+        printf("command name: %s  \t\t Number of arguments: %d",head->binaryFile,head->num_args);
+        if (head->next_simple!=NULL) printf("\n");
+        // printf(" PID:%d Background:%d Current:%d\n",head->det_com.pid,head->det_com.background,head->det_com.current);
+        head = head->next_simple;
+    }
+    printf("\n");
+}
+
+void SimpleExecution(struct arguments* arguments_list,int max_size_command,int num_args,int pipe_number,int islast) {
+    // PrintArguments(arguments_list);
+    struct arguments* arguments_head = arguments_list;
+    char** args = malloc(sizeof((num_args+1)*sizeof(char*)));
+    int input_re = 0;
+    int output_re = 0;
+    char* output_file = (char *)malloc(max_size_command+1);
+    char* input_file = (char* )malloc(max_size_command+1);
+    int filedes[2]; // pos. 0 output, pos. 1 input of the pipe
+    int filedes2[2];
+
+    for (int j = 0;j<num_args+1;j++){
+        args[j] = (char *)malloc(max_size_command+1);
+    }
+    int i = 0, k = 0;
+    for (i=0;i<num_args;i++){
+        if ((strcmp(arguments_list->argument,"<") == 0 ) || (strcmp(arguments_list->argument,">") == 0 ) ) {    //i/o redirection
+            if (strcmp(arguments_list->argument,">") == 0 ) {   //output redirection
+                output_file = arguments_list->next->argument; 
+                output_re = 1;
+            } else {
+                input_file = arguments_list->next->argument;    //input redirecton
+                input_re = 1;
+            }
+            if (arguments_list->next->next == NULL) break;  //if no file is provided break;
+            arguments_list = arguments_list->next->next;
+            continue;
+        }
+        args[k] = arguments_list->argument;
+        arguments_list = arguments_list->next;
+        k++;
+    }
+    // printf("%s ",args[k]);
+    // PrintCommands(chain_commands);
+    args[k] = NULL;
+
+
+    if (pipe_number % 2 != 0){
+        pipe(filedes); // for odd pipe_number
+    }else{
+        pipe(filedes2); // for even pipe_number
+    }
+
+    int child = fork();
+    if (child < 0) {
+        printf("Fork failed");
+        return;
+    }
+
+    if (child==0) {
+        // printf("Children execution started\n")
+
+
+        if (pipe_number == 0){  //if first commmand in the sequence then we only add pipe to its write end only (provided there is no output redirection using >)
+            if(input_re) {
+                int file_desc1 = open(input_file, O_RDWR); 
+                dup2(file_desc1, 0);
+                close(file_desc1);
+            } 
+            if(output_re) {
+                int file_desc2 = open(output_file, O_WRONLY | O_APPEND); 
+                dup2(file_desc2, 1);
+                close(file_desc2);
+            }
+            else {
+                dup2(filedes2[1], STDOUT_FILENO);
+            }
+        }
+        else if (islast){   //if last commmand in the sequence then we only add pipe to its read end only (provided there is no input redirection using <)
+            if (input_re) {
+                int file_desc1 = open(input_file, O_RDWR); 
+                dup2(file_desc1, 0);
+                close(file_desc1);
+            } else {
+                if (pipe_number % 2 != 0){ // for odd number of commands
+                    dup2(filedes2[0],STDIN_FILENO);
+                }else{ // for even number of commands
+                    dup2(filedes[0],STDIN_FILENO);
+                }
+            }
+            if (output_re) {
+                int file_desc2 = open(output_file, O_WRONLY | O_APPEND); 
+                dup2(file_desc2, 1);
+                close(file_desc2);
+            }
+        } else {    //depending which numbered command it is we decide whether pipe1 will be used as read and pipe2 as write or pipe2 as read and pipe1 as write given no i/o redirection using >,<
+            if (pipe_number % 2 != 0){
+                if (input_re) {
+                    int file_desc1 = open(input_file, O_RDWR); 
+                    dup2(file_desc1, 0);
+                    close(file_desc1);
+                } else {
+                    dup2(filedes2[0],STDIN_FILENO);
+                }
+                if (output_re) {
+                    int file_desc2 = open(output_file, O_WRONLY | O_APPEND); 
+                    dup2(file_desc2, 1);
+                    close(file_desc2);
+                } else {
+                    dup2(filedes[1],STDOUT_FILENO);
+                }
+            }else{ // for even i
+                if (input_re) {
+                    int file_desc1 = open(input_file, O_RDWR); 
+                    dup2(file_desc1, 0);
+                    close(file_desc1);
+                } else {
+                    dup2(filedes[0],STDIN_FILENO);
+                }
+                if (output_re) {
+                    int file_desc2 = open(output_file, O_WRONLY | O_APPEND); 
+                    dup2(file_desc2, 1);
+                    close(file_desc2);
+                } else {
+                    dup2(filedes2[1],STDOUT_FILENO);
+                }
+            }
+        }
+        execvp(args[0],args);
+    } else {
+        //closing the pipes' ends in the parents
+        if (pipe_number == 0){
+            close(filedes2[1]);
+        }
+        else if (islast){
+            if (pipe_number % 2 != 0){
+                close(filedes2[0]);
+            }else{
+                close(filedes[0]);
+            }
+        }else{
+            if (pipe_number % 2 != 0){
+                close(filedes2[0]);
+                close(filedes[1]);
+            }else{
+                close(filedes[0]);
+                close(filedes2[1]);
+            }
+        }
+        int status;
+        int corpse = wait(&status);
+        if (corpse != -1 && WIFEXITED(status))
+        {
+            int estat = WEXITSTATUS(status);
+            char *err = (estat == 0) ? "success" : "failure";
+            if (estat!=0) {printf("Error in executing the command "); PrintArguments(arguments_head); printf("\n");}
+            // printf(" PID %d exited with status %d (%s)\n", child, estat, err);
+        }
+        else {
+            printf("Didn't exit was signalled ");
+            PrintArguments(arguments_head);
+            printf("\n");
+        }
+        // printf("Number of arguments: %d Starting execution for ",num_args);
+        // for (int i = 0;i<num_args+1;i++) {
+        //     printf("%s ",args[i]);
+        // }
+        // printf("Execution completed\n");
+    }
+}
+
+//for execution of each atomic command in redirection using pipes
+void HandleMultiple(struct simple_command* chain_head,int max_size_command) {
+    struct simple_command* chain_curr = chain_head;
+    int pipe_number = 0;
+    while(chain_curr!=NULL) {
+        // printf("Command binary: %s",chain_curr->binaryFile);
+        // PrintArguments(chain_curr->arguments);
+        int islast = 0;
+        if (chain_curr->next_simple==NULL) islast = 1;
+        SimpleExecution(chain_curr->arguments,max_size_command,chain_curr->num_args,pipe_number,islast);
+        chain_curr = chain_curr->next_simple;
+        pipe_number = pipe_number+1;
+    }
+}
+
+int Exec(struct command execute,int max_size_command,int background) {
     //make a thread and execute and calculate the time
     // printf("%d ",execute.command_index);
     // PrintArguments(execute.arguments);
     // printf("\n");
+
+    signal(SIGCHLD, handler);
+
+    int num_pipes = 0;
+    struct simple_command *commands_chain_head = execute.basic;
+    struct simple_command *commands_chain_curr = commands_chain_head;
+    while (commands_chain_curr != NULL) {
+        // printf("\nAnother pipe added: %d %s",num_pipes,commands_chain_curr->binaryFile);
+        num_pipes = num_pipes + 1;
+        commands_chain_curr = commands_chain_curr->next_simple;
+    }
+
     int n_args = execute.num_args+2;
     char** args = malloc(sizeof(n_args*sizeof(char*)));
-    for (int j = 0;j<n_args;j++){
-        args[j] = (char *)malloc(max_size_command+1);
+    int input_re = 0;
+    int output_re = 0;
+    char* output_file = (char *)malloc(max_size_command+1);
+    char* input_file = (char* )malloc(max_size_command+1);
+    if (num_pipes == 1 || num_pipes == 0) {
+        for (int j = 0;j<n_args;j++){
+            args[j] = (char *)malloc(max_size_command+1);
+        }
+        struct arguments* curr = execute.arguments;
+        int i = 0, k = 0;
+        for (i=0;i<n_args-1;i++){
+            if ( (strcmp(curr->argument,"<") == 0 ) || (strcmp(curr->argument,">") == 0 ) ) {
+                    if (strcmp(curr->argument,">") == 0) {
+                        output_file = curr->next->argument; 
+                        output_re = 1;
+                        if (curr->next->next == NULL) break;
+                        curr = curr->next->next;
+                    } else {
+                        input_file = curr->next->argument;
+                        input_re = 1;
+                        if (curr->next->next == NULL) break;
+                        curr = curr->next->next;
+                    }
+                continue;
+            }
+            args[k] = curr->argument;
+            curr = curr->next;
+            k++;
+        }
+        // printf("%s ",args[k]);
+        // PrintCommands(chain_commands);
+        args[k] = NULL;
+        // printf("Total args w/o redirection: %d Number of pipes %d",k,num_pipes);
+
     }
-    struct arguments* curr = execute.arguments;
-    int i = 0;
-    for (i=0;i<n_args-1;i++){
-        args[i] = curr->argument;
-        curr = curr->next;
-    }
-    args[i] = NULL;
 
     int p[2];
     if (pipe(p) < 0) {
@@ -296,17 +565,49 @@ int Exec(struct command execute,int max_size_command) {
         printf("Fork failed");
         return -1;
     }
-    if (rc==0){
+    if (rc==0){ 
+
+        if(input_re) {
+            int file_desc1 = open(input_file, O_RDWR);
+            if (file_desc1 < 0) {
+                printf("Error in opening the file %s\n",input_file);
+                return -1;
+            } 
+            dup2(file_desc1, 0);
+            close(file_desc1);
+        }
+        if(output_re) {
+            int file_desc2 = open(output_file, O_WRONLY | O_APPEND);
+            if (file_desc2 < 0) {
+                printf("Error in opening the file %s\n",output_file);
+                return -1;
+            } 
+            dup2(file_desc2, 1);
+            close(file_desc2);
+        } 
+
         close(p[0]);
         long time_start;
         time_start = time(0);
         if (write(p[1],&time_start,sizeof(time_start)) == -1) perror("write () error in child");
-        execvp(execute.binaryFile,args);
+
+
+        if (num_pipes == 1) {
+            execvp(execute.binaryFile,args);
+        } else {
+            // printf("\nMultiple pipes %d %s\n",num_pipes,commands_chain_head->binaryFile);
+            // Exec_simple_commands(commands_chain_head,max_size_command,num_pipes);
+            // printf("\nExecution started\n");
+            struct simple_command* chain_head = commands_chain_head;
+            HandleMultiple(chain_head,max_size_command);
+        }
+        
         // if (errno == ENOENT)
         //     _exit(-1);
         // _exit(-2);
         exit(errno);
     } else {
+        if (background) return rc;
         int status;
         int corpse = wait(&status);
         long end_time,start_time;
@@ -314,67 +615,22 @@ int Exec(struct command execute,int max_size_command) {
         close(p[1]);
         if (read(p[0],&start_time,sizeof(start_time))==-1) perror("read() error in parent");
         printf("---- ");
-        for (int j = 0;j<n_args-1;j++) {
-            printf("%s ",args[j]);
-        }
-        printf("executed with");
+        // for (int j = 0;j<k;j++) {
+        //     printf("%s ",args[j]);
+        // }
+        PrintArguments(execute.arguments);
+        printf(" executed with");
         if (corpse != -1 && WIFEXITED(status))
         {
             int estat = WEXITSTATUS(status);
             char *err = (estat == 0) ? "success" : "failure";
-            printf(" PID %d exited with status %d (%s)", rc, estat, err);
+            printf(" PID %d exited with status %d", rc, estat);
             printf(" in %ld ms----\n",end_time-start_time);
         }
         else
             printf(" PID %d and didn't exit; it was signalled", corpse);
         return rc;
         // printf("\nParent %d, %d\n",rc, getpid());
-    }
-}
-
-int Exec_background(struct command execute,int max_size_command) {
-
-    signal(SIGCHLD, handler);
-
-    int n_args = execute.num_args+2;
-    char** args = malloc(sizeof(n_args*sizeof(char*)));
-    for (int j = 0;j<n_args;j++){
-        args[j] = (char *)malloc(max_size_command+1);
-    }
-    struct arguments* curr = execute.arguments;
-    int i = 0;
-    for (i=0;i<n_args-1;i++){
-        args[i] = curr->argument;
-        curr = curr->next;
-    }
-    args[i] = NULL;
-
-    int p[2];
-    if (pipe(p) < 0) {
-        printf("Pipe failed for inter-process communication");
-        return -1;}
-
-    int rc = fork();
-    if (rc < 0){
-        printf("Fork failed");
-        return -1;
-    }
-    if (rc==0){
-        close(p[0]);
-        long time_start;
-        time_start = time(0);
-        if (write(p[1],&time_start,sizeof(time_start)) == -1) perror("write () error in child");
-        close(p[1]);
-        // int fd = open("fileName", O_RDWR| O_APPEND | O_CREAT, S_IRUSR | S_IWUSR);
-
-        // dup2(fd, 1);
-        execvp(execute.binaryFile,args);
-        // if (errno == ENOENT)
-        //     _exit(-1);
-        // _exit(-2);
-        exit(errno);
-    } else {
-        return rc;
     }
 }
 
@@ -440,6 +696,7 @@ void command_prompt(struct commands** head_c,char* prog_name){
         int can_be_back = 0;
         char* backup;
         while(executable!=NULL) {
+            // printf("Argument: %s\n",executable);
             if (strlen(executable) > max_size_command) max_size_command = strlen(executable);
             executable = strtok(NULL," ");
             if (executable!=NULL){
@@ -469,6 +726,51 @@ void command_prompt(struct commands** head_c,char* prog_name){
         exec_command.background = 0;
         exec_command.current = 1;
         // printf("\nInfo: %d %s %d %d",exec_command.command_index,exec_command.binaryFile,exec_command.num_args,num_arg);
+
+        struct arguments* curr_arg = head;
+        struct arguments* chain_args = NULL;
+        struct simple_command* chain_commands = NULL;
+        char* starting = curr_arg->argument;
+        int start = 0;
+        int end = 0;
+        int illegal = 0;
+        while(curr_arg!=NULL) {
+            if (strcmp(curr_arg->argument,"|") == 0) {
+                struct simple_command command_in_chain;
+                command_in_chain.binaryFile = starting;
+                command_in_chain.arguments = chain_args;
+                command_in_chain.num_args = end-start;
+                // printf("\nNumber of arguments: %d\n",end-start);
+                AddSimpleCommand(&chain_commands,command_in_chain);
+                chain_args = NULL;
+                if (curr_arg->next == NULL) {
+                    illegal = 1;
+                    break;
+                }
+                end = end + 1;
+                start = end;
+                starting = curr_arg->next->argument;
+                // chain_args = NULL;
+                curr_arg = curr_arg->next;
+            } else {
+                addArgument(&chain_args,curr_arg->argument);
+                curr_arg = curr_arg->next;
+                end=end+1;
+            }
+        }
+        if (illegal) {
+            printf("Illegal syntax");
+            continue;
+        }
+        struct simple_command command_in_chain;
+        command_in_chain.binaryFile = starting;
+        command_in_chain.arguments = chain_args;
+        command_in_chain.num_args = end - start;
+        AddSimpleCommand(&chain_commands,command_in_chain);
+        // printf("Basic commands in this:\n");
+        // PrintSimpleCommand(chain_commands);
+        // printf("Basic commands in this:\n");
+        exec_command.basic = chain_commands;
 
 
         int pid;
@@ -549,6 +851,8 @@ void command_prompt(struct commands** head_c,char* prog_name){
                 // printf("\n%d",total_commands);
                 // PrintHis(*head_c,total_commands,atoi(number));
                 exec_command = Search(*head_c,1,atoi(number),"\0",-1);
+                // printf("%s",exec_command.basic->binaryFile);
+                // exec_command.basic = NULL;
                 background_process = exec_command.background;
                 // printf("%d",exec_history.command_index);
                 // printf("\nInfo: %d %s %d %d %d\n",exec_history.command_index,exec_history.binaryFile,exec_history.num_args,exec_history.pid,exec_history.background);
@@ -560,11 +864,11 @@ void command_prompt(struct commands** head_c,char* prog_name){
         total_commands = total_commands + 1;
         exec_command.command_index = total_commands;
         if(background_process == 0) {
-            pid = Exec(exec_command,max_size_command);
+            pid = Exec(exec_command,max_size_command,0);
             exec_command.current = 0;    
         }
         else {
-            pid = Exec_background(exec_command,max_size_command);
+            pid = Exec(exec_command,max_size_command,1);
             exec_command.background = 1;
             addCurrentProc(&curr_proc_h,pid,exec_command.binaryFile);
         }
